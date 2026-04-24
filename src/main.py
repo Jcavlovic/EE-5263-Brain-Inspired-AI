@@ -8,12 +8,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
+# Ensure the flat src/ modules (`dataset`, `labels`, `model`, `train`) remain
+# importable when Python's spawn start method re-imports this script inside
+# DataLoader worker processes (this is the only method available on Windows).
+_SRC_DIR = str(Path(__file__).resolve().parent)
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
+
 import matplotlib
 
-matplotlib.use("Agg")  # no display needed
+matplotlib.use("Agg")  # headless-safe on Windows, Linux, macOS
 
 import matplotlib.pyplot as plt
 import torch
@@ -178,7 +186,16 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--out-dir", default="results")
     p.add_argument("--image-size", type=int, default=64)
-    p.add_argument("--workers", type=int, default=2)
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help=(
+            "DataLoader worker processes. Default 0 (no multiprocessing) is "
+            "the safest choice on Windows, which uses spawn. On Linux/macOS "
+            "values like 2-4 can be faster."
+        ),
+    )
     p.add_argument(
         "--quick",
         action="store_true",
