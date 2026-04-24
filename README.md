@@ -44,23 +44,38 @@ data/LFW/lfw-deepfunneled/lfw-deepfunneled/<Person_Name>/<Person_Name>_NNNN.jpg
 
 Pass a different location via `--lfw-root <path>` if needed.
 
-### Run
-
-Cross-platform (works on Windows, Linux, macOS):
+### Run — one-at-a-time sweeps (6 plots)
 
 ```bash
 python src/main.py               # full sweep: epochs ∈ {25, 100, 200} — hours on CPU
 python src/main.py --quick       # caps epoch-sweep at 25 epochs — ~25 min on CPU
 python src/main.py --only hidden_layers sparsity   # subset of sweeps
+python src/main.py --preload     # same runs but cache all images in RAM first — ~15× faster
 ```
 
-On Windows, `--workers 0` (the default) is recommended; raise it on Linux/
-macOS for faster image loading. GPU is used automatically when
-`torch.cuda.is_available()` is true, otherwise the code falls back to CPU.
+Outputs in `results/`:
+- `sweep_<parameter>.png` (six of them), `summary.json`.
 
-Outputs land in `results/`:
+### Run — full cross-product (1,152 configs)
 
-- `sweep_hidden_layers.png`, `sweep_neurons_per_layer.png`, `sweep_sparsity.png`,
-  `sweep_learning_rate.png`, `sweep_epochs.png`, `sweep_batch_size.png`
-- `summary.json` — defaults used plus every run's per-epoch stats,
-  final/best accuracy, and wall time.
+```bash
+python src/main.py --cross-product        # 4 × 4 × 4 × 3 × 3 × 2 = 1,152 runs
+```
+
+Implies `--preload`. Streams one JSON line per completed run into
+`results/cross_results.jsonl`, so interrupting and rerunning the same command
+skips already-completed configs. Estimated wall time at full depth (all
+epoch counts including 200): **~5 h on an RTX 3070**, ~24 h on a modern
+multi-core CPU.
+
+Outputs in `results/`:
+- `cross_results.jsonl` — one record per run (config + best/final acc + wall time). Resumable.
+- `cross_marginals.png` — mean best test accuracy per value of each axis.
+- `cross_heatmaps.png` — grid of `hidden_layers × neurons_per_layer` heatmaps, one panel per `(learning_rate, epochs, batch_size)` triple, averaged over sparsity.
+- `cross_top_configs.txt` — top-20 configs by best test accuracy.
+
+### Notes
+
+- GPU used automatically when `torch.cuda.is_available()`; CPU fallback otherwise.
+- With `--preload` the cached tensor is ~90 MB at the default 64×64 grayscale size; on GPU it lives in VRAM so `__getitem__` returns device-local views.
+- On Windows, `--workers 0` (the default) is the safest choice because of spawn-mode pickling. Preloaded data doesn't use workers at all.

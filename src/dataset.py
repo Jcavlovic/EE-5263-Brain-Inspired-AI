@@ -13,6 +13,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
+from tqdm.auto import tqdm
 
 from labels import Sample
 
@@ -40,6 +41,8 @@ def _default_transform(cfg: DatasetConfig) -> transforms.Compose:
 
 
 class LFWGenderDataset(Dataset):
+    """Decode images on demand. Simple but becomes I/O-bound across many runs."""
+
     def __init__(self, samples: list[Sample], cfg: DatasetConfig):
         self.samples = samples
         self.cfg = cfg
@@ -54,6 +57,44 @@ class LFWGenderDataset(Dataset):
             x = self.transform(img.convert("RGB"))
         y = torch.tensor(float(s.label), dtype=torch.float32)
         return x, y
+
+
+class PreloadedLFWGenderDataset(Dataset):
+    """Decode every image once into a single contiguous tensor kept in RAM.
+
+    For a 64x64 grayscale split with ~5.6k images the whole dataset is ~90 MB,
+    so we pay the decode + resize cost once and subsequent epochs become pure
+    tensor indexing. This is what makes large cross-product sweeps feasible.
+    """
+
+    def __init__(self, samples: list[Sample], cfg: DatasetConfig,
+                 desc: str = "preloading"):
+        self.cfg = cfg
+        n = len(samples)
+        dim = cfg.image_size * cfg.image_size
+        self.images = torch.empty((n, dim), dtype=torch.float32)
+        self.labels = torch.empty(n, dtype=torch.float32)
+
+        xform = _default_transform(cfg)
+        for i, s in enumerate(tqdm(samples, desc=desc, unit="img",
+                                    dynamic_ncols=True)):
+            with Image.open(s.path) as img:
+                self.images[i] = xform(img.convert("RGB"))
+            self.labels[i] = float(s.label)
+
+    def __len__(self) -> int:
+        return self.images.size(0)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.images[idx], self.labels[idx]
+
+    def to(self, device: torch.device) -> "PreloadedLFWGenderDataset":
+        """Move cached tensors onto a device (e.g. cuda) so __getitem__ returns
+        device tensors directly and DataLoader doesn't have to copy per batch.
+        """
+        self.images = self.images.to(device)
+        self.labels = self.labels.to(device)
+        return self
 
 
 def balance_and_split(

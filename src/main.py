@@ -7,6 +7,7 @@ curves and final test accuracies with matplotlib.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import sys
 from dataclasses import asdict, dataclass, field, replace
@@ -24,10 +25,17 @@ import matplotlib
 matplotlib.use("Agg")  # headless-safe on Windows, Linux, macOS
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
-from dataset import DatasetConfig, LFWGenderDataset, balance_and_split
+from dataset import (
+    DatasetConfig,
+    LFWGenderDataset,
+    PreloadedLFWGenderDataset,
+    balance_and_split,
+)
 from labels import build_labeled_samples, summarize
 from model import ModelConfig, RateBasedNN
 from train import RunResult, TrainConfig, train_model
@@ -69,9 +77,14 @@ def make_model(d: Defaults, input_dim: int) -> RateBasedNN:
     ))
 
 
-def make_loaders(train_ds: LFWGenderDataset, test_ds: LFWGenderDataset,
-                 batch_size: int, workers: int) -> tuple[DataLoader, DataLoader]:
-    common = dict(num_workers=workers, pin_memory=torch.cuda.is_available())
+def make_loaders(train_ds, test_ds, batch_size: int,
+                 workers: int) -> tuple[DataLoader, DataLoader]:
+    # If the data is preloaded (often onto GPU), worker processes can't share
+    # those tensors and pin_memory is a no-op — force the simple path.
+    if isinstance(train_ds, PreloadedLFWGenderDataset):
+        common = dict(num_workers=0, pin_memory=False)
+    else:
+        common = dict(num_workers=workers, pin_memory=torch.cuda.is_available())
     return (
         DataLoader(train_ds, batch_size=batch_size, shuffle=True, **common),
         DataLoader(test_ds, batch_size=batch_size, shuffle=False, **common),
@@ -177,6 +190,246 @@ def sweep(
     plot_sweep(points, param_name, xlabel, out_dir)
 
 
+# ---- Cross-product runner --------------------------------------------------
+
+CROSS_AXES = (
+    "hidden_layers", "neurons_per_layer", "sparsity",
+    "learning_rate", "epochs", "batch_size",
+)
+
+
+def _config_key(cfg: dict) -> str:
+    """Stable identifier for one cross-product config (used for resume)."""
+    return "|".join(f"{k}={cfg[k]}" for k in CROSS_AXES)
+
+
+def _load_done_keys(jsonl_path: Path) -> dict[str, dict]:
+    done: dict[str, dict] = {}
+    if not jsonl_path.exists():
+        return done
+    with jsonl_path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                done[_config_key(rec["config"])] = rec
+            except (json.JSONDecodeError, KeyError):
+                continue
+    return done
+
+
+def run_cross_product(
+    defaults: Defaults,
+    train_ds,
+    test_ds,
+    device: torch.device,
+    workers: int,
+    out_dir: Path,
+) -> list[dict]:
+    """Full cross-product: 4 × 4 × 4 × 3 × 3 × 2 = 1,152 runs.
+
+    Results stream to `cross_results.jsonl` after each run so the sweep can be
+    resumed after interruption without losing work.
+    """
+    jsonl_path = out_dir / "cross_results.jsonl"
+    already_done = _load_done_keys(jsonl_path)
+    if already_done:
+        print(f"Resuming: {len(already_done)} configs already complete in "
+              f"{jsonl_path.name}")
+
+    combos = list(itertools.product(
+        HIDDEN_LAYERS, NEURONS_PER_LAYER, SPARSITY,
+        LEARNING_RATES, EPOCH_CHOICES, BATCH_SIZES,
+    ))
+    print(f"Cross-product: {len(combos)} total runs "
+          f"({len(combos) - len(already_done)} remaining)")
+
+    records: list[dict] = list(already_done.values())
+    bar = tqdm(combos, desc="cross-product", unit="run", dynamic_ncols=True)
+
+    with jsonl_path.open("a") as jf:
+        for layers, neurons, sparsity, lr, epochs, batch in bar:
+            cfg = dict(
+                hidden_layers=layers,
+                neurons_per_layer=neurons,
+                sparsity=sparsity,
+                learning_rate=lr,
+                epochs=epochs,
+                batch_size=batch,
+            )
+            key = _config_key(cfg)
+            if key in already_done:
+                continue
+
+            bar.set_postfix(
+                L=layers, N=neurons, S=f"{int(sparsity * 100)}",
+                lr=lr, E=epochs, B=batch,
+            )
+            result = run_one(defaults, train_ds, test_ds, device, workers,
+                             override=cfg)
+            rec = {
+                "config": cfg,
+                "final_test_acc": result.final_test_acc,
+                "best_test_acc": result.best_test_acc,
+                "final_train_acc": result.stats[-1].train_acc if result.stats else float("nan"),
+                "wall_time_s": result.wall_time_s,
+            }
+            jf.write(json.dumps(rec, default=str) + "\n")
+            jf.flush()
+            records.append(rec)
+    bar.close()
+    return records
+
+
+def _pivot(records: list[dict], row_axis: str, col_axis: str,
+           row_vals: list, col_vals: list, metric: str,
+           filter_: dict | None = None) -> np.ndarray:
+    """Average `metric` over records that match `filter_`, producing an
+    (|row_vals|, |col_vals|) grid. Missing cells come back as NaN.
+    """
+    grid = np.full((len(row_vals), len(col_vals)), np.nan, dtype=np.float64)
+    counts = np.zeros_like(grid)
+
+    for rec in records:
+        cfg = rec["config"]
+        if filter_ and any(cfg[k] != v for k, v in filter_.items()):
+            continue
+        try:
+            i = row_vals.index(cfg[row_axis])
+            j = col_vals.index(cfg[col_axis])
+        except ValueError:
+            continue
+        val = rec[metric]
+        if np.isnan(grid[i, j]):
+            grid[i, j] = val
+            counts[i, j] = 1
+        else:
+            grid[i, j] = (grid[i, j] * counts[i, j] + val) / (counts[i, j] + 1)
+            counts[i, j] += 1
+    return grid
+
+
+def plot_cross_marginals(records: list[dict], out_dir: Path) -> None:
+    """One bar chart per axis: mean best-test-acc over all other dims."""
+    fig, axes = plt.subplots(2, 3, figsize=(15, 7))
+    axes = axes.flatten()
+
+    axis_values = {
+        "hidden_layers": HIDDEN_LAYERS,
+        "neurons_per_layer": NEURONS_PER_LAYER,
+        "sparsity": SPARSITY,
+        "learning_rate": LEARNING_RATES,
+        "epochs": EPOCH_CHOICES,
+        "batch_size": BATCH_SIZES,
+    }
+
+    for ax, (axis, values) in zip(axes, axis_values.items()):
+        means = []
+        for v in values:
+            vals = [r["best_test_acc"] for r in records if r["config"][axis] == v]
+            means.append(float(np.mean(vals)) if vals else float("nan"))
+        ax.bar(range(len(values)), means, color="#3b7ddd")
+        ax.set_xticks(range(len(values)))
+        ax.set_xticklabels([str(v) for v in values])
+        ax.set_title(f"Mean best test acc vs {axis}")
+        ax.set_ylabel("mean best test acc")
+        ax.set_ylim(0.4, 1.0)
+        ax.grid(True, axis="y", alpha=0.3)
+
+    fig.tight_layout()
+    out_path = out_dir / "cross_marginals.png"
+    fig.savefig(out_path, dpi=130)
+    plt.close(fig)
+    print(f"  wrote {out_path}")
+
+
+def plot_cross_heatmaps(records: list[dict], out_dir: Path) -> None:
+    """For each (learning_rate, epochs, batch_size) triple, show a
+    (hidden_layers × neurons_per_layer) heatmap of mean best test acc
+    averaged across the 4 sparsity values.
+    """
+    n_rows = len(LEARNING_RATES)
+    n_cols = len(EPOCH_CHOICES) * len(BATCH_SIZES)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(2.4 * n_cols, 2.5 * n_rows),
+                             squeeze=False)
+
+    # Shared color scale across all heatmaps for comparability.
+    all_grids = []
+    for lr in LEARNING_RATES:
+        for ep in EPOCH_CHOICES:
+            for bs in BATCH_SIZES:
+                grid = _pivot(records, "hidden_layers", "neurons_per_layer",
+                              HIDDEN_LAYERS, NEURONS_PER_LAYER,
+                              metric="best_test_acc",
+                              filter_={"learning_rate": lr, "epochs": ep, "batch_size": bs})
+                all_grids.append(grid)
+    finite = [g[np.isfinite(g)] for g in all_grids]
+    flat = np.concatenate(finite) if any(len(a) for a in finite) else np.array([0.5, 1.0])
+    vmin = float(np.min(flat)) if flat.size else 0.5
+    vmax = float(np.max(flat)) if flat.size else 1.0
+
+    col_idx = 0
+    for j_ep, ep in enumerate(EPOCH_CHOICES):
+        for j_bs, bs in enumerate(BATCH_SIZES):
+            for i_lr, lr in enumerate(LEARNING_RATES):
+                grid = _pivot(records, "hidden_layers", "neurons_per_layer",
+                              HIDDEN_LAYERS, NEURONS_PER_LAYER,
+                              metric="best_test_acc",
+                              filter_={"learning_rate": lr, "epochs": ep, "batch_size": bs})
+                ax = axes[i_lr][col_idx]
+                im = ax.imshow(grid, vmin=vmin, vmax=vmax, cmap="viridis",
+                               aspect="auto")
+                ax.set_xticks(range(len(NEURONS_PER_LAYER)))
+                ax.set_xticklabels(NEURONS_PER_LAYER, fontsize=7)
+                ax.set_yticks(range(len(HIDDEN_LAYERS)))
+                ax.set_yticklabels(HIDDEN_LAYERS, fontsize=7)
+                if i_lr == 0:
+                    ax.set_title(f"epochs={ep}, batch={bs}", fontsize=8)
+                if col_idx == 0:
+                    ax.set_ylabel(f"lr={lr}\nlayers", fontsize=8)
+                else:
+                    ax.set_ylabel("layers", fontsize=7)
+                ax.set_xlabel("neurons", fontsize=7)
+                for ii in range(grid.shape[0]):
+                    for jj in range(grid.shape[1]):
+                        v = grid[ii, jj]
+                        if np.isfinite(v):
+                            ax.text(jj, ii, f"{v:.2f}", ha="center", va="center",
+                                    color="white" if v < (vmin + vmax) / 2 else "black",
+                                    fontsize=7)
+            col_idx += 1
+
+    fig.suptitle("Mean best test accuracy — averaged over sparsity", y=1.02)
+    fig.tight_layout()
+    out_path = out_dir / "cross_heatmaps.png"
+    fig.savefig(out_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  wrote {out_path}")
+
+
+def write_cross_top_configs(records: list[dict], out_dir: Path, n: int = 20) -> None:
+    top = sorted(records, key=lambda r: r["best_test_acc"], reverse=True)[:n]
+    out_path = out_dir / "cross_top_configs.txt"
+    lines = [f"Top {n} configs by best test accuracy\n" + "=" * 44 + ""]
+    for r in top:
+        cfg = r["config"]
+        lines.append(
+            f"best_test_acc={r['best_test_acc']:.4f}  "
+            f"final_test_acc={r['final_test_acc']:.4f}  "
+            f"wall={r['wall_time_s']:.1f}s  "
+            f"| layers={cfg['hidden_layers']} neurons={cfg['neurons_per_layer']} "
+            f"sparsity={cfg['sparsity']} lr={cfg['learning_rate']} "
+            f"epochs={cfg['epochs']} batch={cfg['batch_size']}"
+        )
+    out_path.write_text("\n".join(lines) + "\n")
+    print(f"  wrote {out_path}")
+
+
+# ---- CLI -------------------------------------------------------------------
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument(
@@ -206,6 +459,25 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         default=None,
         help="Run only the named sweeps (e.g. --only hidden_layers sparsity).",
+    )
+    p.add_argument(
+        "--cross-product",
+        action="store_true",
+        help=(
+            "Run the full 1,152-config cross-product sweep "
+            "(hidden_layers × neurons × sparsity × lr × epochs × batch). "
+            "Implies --preload. Results stream to cross_results.jsonl so the "
+            "run is resumable."
+        ),
+    )
+    p.add_argument(
+        "--preload",
+        action="store_true",
+        help=(
+            "Decode and resize every LFW image once into a cached tensor in RAM. "
+            "Makes epochs ~10x faster on GPU by removing the DataLoader "
+            "preprocessing bottleneck. Auto-enabled with --cross-product."
+        ),
     )
     return p.parse_args()
 
@@ -240,11 +512,39 @@ def main() -> None:
         f"F={sum(1 for s in test_samples if s.label == 1)})"
     )
 
-    train_ds = LFWGenderDataset(train_samples, ds_cfg)
-    test_ds = LFWGenderDataset(test_samples, ds_cfg)
+    preload = args.preload or args.cross_product
+    if preload:
+        train_ds = PreloadedLFWGenderDataset(train_samples, ds_cfg,
+                                             desc="preload train")
+        test_ds = PreloadedLFWGenderDataset(test_samples, ds_cfg,
+                                            desc="preload test ")
+        # Move cached tensors to GPU up front — turns __getitem__ into a
+        # device-local tensor view, so DataLoader copies nothing per batch.
+        if device.type == "cuda":
+            train_ds.to(device)
+            test_ds.to(device)
+            print("Preloaded datasets moved to GPU.")
+    else:
+        train_ds = LFWGenderDataset(train_samples, ds_cfg)
+        test_ds = LFWGenderDataset(test_samples, ds_cfg)
 
     defaults = Defaults(image_size=args.image_size)
     summary: list[dict] = []
+
+    if args.cross_product:
+        records = run_cross_product(
+            defaults=defaults,
+            train_ds=train_ds,
+            test_ds=test_ds,
+            device=device,
+            workers=args.workers,
+            out_dir=out_dir,
+        )
+        print(f"\nCross-product complete: {len(records)} runs total")
+        plot_cross_marginals(records, out_dir)
+        plot_cross_heatmaps(records, out_dir)
+        write_cross_top_configs(records, out_dir)
+        return
 
     epoch_values = [e for e in EPOCH_CHOICES if not args.quick or e <= 25]
 
